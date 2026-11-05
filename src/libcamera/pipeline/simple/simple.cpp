@@ -16,6 +16,7 @@
 #include <set>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -2027,6 +2028,16 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
 	std::shared_ptr<MediaDevice> media;
 
 	for (const SimplePipelineInfo &inf : supportedDevices) {
+		/*
+		 * IPU7 with a usable PSYS (hardware ISP) device is handled by the
+		 * ipu7 pipeline handler; only fall back to the software ISP when the
+		 * PSYS driver is absent.
+		 */
+		if (!strcmp(inf.driver, "intel-ipu7") && !access("/dev/ipu7-psys0", R_OK | W_OK)) {
+			LOG(SimplePipeline, Debug) << "IPU7 PSYS available, leaving IPU7 to the ipu7 handler";
+			continue;
+		}
+
 		DeviceMatch dm(inf.driver);
 		while ((media = acquireMediaDevice(enumerator, dm))) {
 			/*
