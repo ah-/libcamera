@@ -17,6 +17,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <deque>
 #include <queue>
 #include <string.h>
 #include <sys/stat.h>
@@ -26,7 +27,9 @@
 #include <linux/media-bus-format.h>
 #include <linux/v4l2-controls.h>
 
+#include <libcamera/base/event_notifier.h>
 #include <libcamera/base/log.h>
+#include <libcamera/base/timer.h>
 #include <libcamera/base/utils.h>
 
 #include <libcamera/camera.h>
@@ -108,8 +111,15 @@ public:
 	int allocateSharedBuffers();
 	int allocatePsysBuffers();
 	void rawBufferReady(FrameBuffer *buffer);
-	int process(FrameBuffer *raw, Request *request, FrameBuffer *out);
 	void setSensorControls(ControlList &ctrls);
+
+	/* asynchronous frame processing: node 0 -> stats -> node 1 -> complete */
+	void tryStartFrame();
+	void psysReady();
+	void finishFrame(int ret);
+	void watchdogTimeout();
+	void abortFrame();
+	const PSysDevice::Buffer *outputBuffer(FrameBuffer *out, bool *zeroCopy);
 
 	Stream stream_;
 	std::unique_ptr<CameraSensor> sensor_;
@@ -137,6 +147,25 @@ public:
 	/* PSYS-internal buffers */
 	PSysDevice::Buffer stats11_, psOut_, meOut_;
 	PSysDevice::Buffer ref_[2], hist13_[2], hist8_[2];
+
+	/* output buffers imported into the PSYS for zero-copy (dma-buf fd -> registration) */
+	std::map<int, PSysDevice::Buffer> outPsys_;
+
+	struct Job {
+		FrameBuffer *raw = nullptr;
+		Request *request = nullptr;
+		FrameBuffer *out = nullptr;
+		const PSysDevice::Buffer *outBuf = nullptr;
+		bool zeroCopy = false;
+		uint32_t frame = 0;
+		uint8_t fid = 0;
+		int stage = 0;		/* 0 idle, 1 node 0 running, 2 node 1 running */
+		ControlList metadata;
+	};
+	Job job_;
+	std::deque<FrameBuffer *> readyRaw_;
+	std::unique_ptr<EventNotifier> psysNotifier_;
+	Timer watchdog_;
 
 	unsigned int frame_ = 0;
 	bool running_ = false;
@@ -241,6 +270,7 @@ int IPU7CameraData::init(MediaDevice *media)
 	if (ret)
 		return ret;
 	capture_->bufferReady.connect(this, &IPU7CameraData::rawBufferReady);
+	watchdog_.timeout.connect(this, &IPU7CameraData::watchdogTimeout);
 
 	const std::string dir = dataDir();
 	if (!readFile(dir + "/graph/graph_info.bin", &graphInfo_) ||
@@ -342,60 +372,44 @@ void IPU7CameraData::setSensorControls(ControlList &ctrls)
 		sensor_->setControls(&ctrls);
 }
 
-int IPU7CameraData::process(FrameBuffer *raw, Request *request, FrameBuffer *out)
+const PSysDevice::Buffer *IPU7CameraData::outputBuffer(FrameBuffer *out, bool *zeroCopy)
 {
 	using ipa::ipu7::BufferId;
-
-	auto it = rawPsys_.find(raw->planes()[0].fd.get());
-	if (it == rawPsys_.end())
-		return -EINVAL;
-	const PSysDevice::Buffer *rawBuf = &it->second;
-
-	const uint32_t frame = frame_;
-	const uint8_t fid = frame_ & 0xff;
-	frame_++;	/* frame ids advance per submitted frame, even if it fails */
-
-	ipa_->computeParams(frame);
-
-	int ret = psys_.run(0, fid, {
-		{ 12, sb(BufferId::StatsRgbs) }, { 11, &stats11_ }, { 10, sb(BufferId::StatsAe) },
-		{ 8, sb(BufferId::LscTable) }, { 2, sb(BufferId::LbffSystem) }, { 1, sb(BufferId::LbffProgram) },
-		{ 13, sb(BufferId::StatsSat) }, { 0, sb(BufferId::LbffParams) },
-		{ 19, &psOut_ }, { 18, &meOut_ }, { 5, rawBuf },
-	});
-	if (ret)
-		return ret;
-
-	ControlList sensorCtrls;
-	ControlList metadata;
-	ipa_->processStats(frame, &sensorCtrls, &metadata);
-	setSensorControls(sensorCtrls);
-
-	const unsigned int cur = fid & 1 ? 0 : 1, prev = fid & 1;
-	ret = psys_.run(1, fid, {
-		{ 5, &hist13_[prev] }, { 7, &meOut_ }, { 9, &psOut_ }, { 14, sb(BufferId::Output) },
-		{ 1, sb(BufferId::BbpsProgram) }, { 0, sb(BufferId::BbpsParams) }, { 13, &hist13_[cur] },
-		{ 2, sb(BufferId::BbpsSystem) }, { 3, sb(BufferId::BbpsFrame) },
-		{ 8, &hist8_[cur] }, { 11, &hist8_[cur] }, { 6, &hist8_[prev] },
-		{ 12, &ref_[cur] }, { 10, &ref_[prev] },
-	});
-	if (ret)
-		return ret;
-
 	const unsigned int ySize = kOutputSize.width * kOutputSize.height;
-	MappedFrameBuffer map(out, MappedFrameBuffer::MapFlag::Write);
-	if (!map.isValid())
-		return -ENOMEM;
-	/* planes of an NV12 buffer from DmaBufAllocator are contiguous in one mapping */
-	const uint8_t *src = outputMap_->planes()[0].data();
-	uint8_t *dst = map.planes()[0].data();
-	memcpy(dst, src, ySize);
-	memcpy(map.planes().size() > 1 ? map.planes()[1].data() : dst + ySize, src + ySize, ySize / 2);
+	const auto &planes = out->planes();
 
-	ipa_->processOutput(frame);
+	/*
+	 * Zero-copy if the buffer is one dma-buf holding contiguous NV12 planes with room for the
+	 * ISP's padded output (our exported buffers are allocated that way).
+	 */
+	bool contiguous = !planes.empty() && planes[0].offset == 0;
+	size_t end = 0;
+	for (unsigned int i = 0; i < planes.size(); i++) {
+		if (planes[i].fd.get() != planes[0].fd.get())
+			contiguous = false;
+		end = std::max<size_t>(end, planes[i].offset + planes[i].length);
+	}
+	if (planes.size() == 2 && planes[1].offset != ySize)
+		contiguous = false;
 
-	request->_d()->metadata().merge(metadata);
-	return 0;
+	if (contiguous && end >= kOutSize) {
+		const int fd = planes[0].fd.get();
+		auto it = outPsys_.find(fd);
+		if (it == outPsys_.end()) {
+			PSysDevice::Buffer pb;
+			if (!psys_.import(fd, kOutSize, &pb)) {
+				it = outPsys_.emplace(fd, pb).first;
+				LOG(IPU7, Debug) << "Zero-copy output buffer (dma-buf " << fd << ")";
+			}
+		}
+		if (it != outPsys_.end()) {
+			*zeroCopy = true;
+			return &it->second;
+		}
+	}
+
+	*zeroCopy = false;
+	return sb(BufferId::Output);
 }
 
 void IPU7CameraData::rawBufferReady(FrameBuffer *raw)
@@ -408,28 +422,183 @@ void IPU7CameraData::rawBufferReady(FrameBuffer *raw)
 		return;
 	}
 
-	Request *request = pendingRequests_.front();
+	/* keep only the newest waiting raw frame (lowest latency) */
+	while (!readyRaw_.empty()) {
+		capture_->queueBuffer(readyRaw_.front());
+		readyRaw_.pop_front();
+	}
+	readyRaw_.push_back(raw);
+	tryStartFrame();
+}
+
+void IPU7CameraData::tryStartFrame()
+{
+	using ipa::ipu7::BufferId;
+
+	if (!running_ || job_.stage || readyRaw_.empty() || pendingRequests_.empty())
+		return;
+
+	Job &j = job_;
+	j = Job{};
+	j.raw = readyRaw_.front();
+	readyRaw_.pop_front();
+	j.request = pendingRequests_.front();
 	pendingRequests_.pop();
-	FrameBuffer *out = request->findBuffer(&stream_);
+	j.out = j.request->findBuffer(&stream_);
+	j.frame = frame_;
+	j.fid = frame_ & 0xff;
+	frame_++;	/* frame ids advance per submitted frame, even if it fails */
 
-	FrameMetadata &md = out->_d()->metadata();
-	md.sequence = raw->metadata().sequence;
-	md.timestamp = raw->metadata().timestamp;
-	request->_d()->metadata().set(controls::SensorTimestamp, raw->metadata().timestamp);
+	FrameMetadata &md = j.out->_d()->metadata();
+	md.sequence = j.raw->metadata().sequence;
+	md.timestamp = j.raw->metadata().timestamp;
+	j.request->_d()->metadata().set(controls::SensorTimestamp, j.raw->metadata().timestamp);
 
-	int ret = process(raw, request, out);
+	auto it = rawPsys_.find(j.raw->planes()[0].fd.get());
+	if (it == rawPsys_.end()) {
+		finishFrame(-EINVAL);
+		return;
+	}
+	j.outBuf = outputBuffer(j.out, &j.zeroCopy);
+
+	ipa_->computeParams(j.frame);
+
+	int ret = psys_.submit(0, j.fid, {
+		{ 12, sb(BufferId::StatsRgbs) }, { 11, &stats11_ }, { 10, sb(BufferId::StatsAe) },
+		{ 8, sb(BufferId::LscTable) }, { 2, sb(BufferId::LbffSystem) }, { 1, sb(BufferId::LbffProgram) },
+		{ 13, sb(BufferId::StatsSat) }, { 0, sb(BufferId::LbffParams) },
+		{ 19, &psOut_ }, { 18, &meOut_ }, { 5, &it->second },
+	});
+	if (ret) {
+		finishFrame(ret);
+		return;
+	}
+	j.stage = 1;
+	watchdog_.start(std::chrono::milliseconds(2000));
+}
+
+void IPU7CameraData::psysReady()
+{
+	using ipa::ipu7::BufferId;
+
+	PSysDevice::Event ev;
+	if (psys_.dequeue(&ev))
+		return;
+	Job &j = job_;
+	if (!j.stage || ev.frame != j.fid)
+		return;		/* stale event (e.g. after a watchdog timeout) */
+
+	if (ev.error) {
+		LOG(IPU7, Warning) << "PSYS node " << int(ev.node) << " frame " << int(ev.frame)
+				   << " error " << ev.error;
+		finishFrame(-EIO);
+		return;
+	}
+
+	if (j.stage == 1) {
+		ControlList sensorCtrls;
+		ipa_->processStats(j.frame, &sensorCtrls, &j.metadata);
+		setSensorControls(sensorCtrls);
+
+		const unsigned int cur = j.fid & 1 ? 0 : 1, prev = j.fid & 1;
+		int ret = psys_.submit(1, j.fid, {
+			{ 5, &hist13_[prev] }, { 7, &meOut_ }, { 9, &psOut_ }, { 14, j.outBuf },
+			{ 1, sb(BufferId::BbpsProgram) }, { 0, sb(BufferId::BbpsParams) }, { 13, &hist13_[cur] },
+			{ 2, sb(BufferId::BbpsSystem) }, { 3, sb(BufferId::BbpsFrame) },
+			{ 8, &hist8_[cur] }, { 11, &hist8_[cur] }, { 6, &hist8_[prev] },
+			{ 12, &ref_[cur] }, { 10, &ref_[prev] },
+		});
+		if (ret) {
+			finishFrame(ret);
+			return;
+		}
+		j.stage = 2;
+		watchdog_.start(std::chrono::milliseconds(2000));
+		return;
+	}
+
+	finishFrame(0);
+}
+
+void IPU7CameraData::watchdogTimeout()
+{
+	LOG(IPU7, Error) << "PSYS frame " << int(job_.fid) << " timed out in stage " << job_.stage;
+	finishFrame(-ETIMEDOUT);
+}
+
+void IPU7CameraData::finishFrame(int ret)
+{
+	watchdog_.stop();
+	Job j = std::move(job_);
+	job_ = Job{};
+
+	const unsigned int ySize = kOutputSize.width * kOutputSize.height;
+	FrameMetadata &md = j.out->_d()->metadata();
+
+	if (!ret) {
+		MappedFrameBuffer map(j.out, MappedFrameBuffer::MapFlag::ReadWrite);
+		if (!map.isValid()) {
+			ret = -ENOMEM;
+		} else {
+			uint8_t *dst = map.planes()[0].data();
+			if (!j.zeroCopy) {
+				/* planes of our NV12 buffers are contiguous in one mapping */
+				const uint8_t *src = outputMap_->planes()[0].data();
+				memcpy(dst, src, ySize);
+				memcpy(map.planes().size() > 1 ? map.planes()[1].data() : dst + ySize,
+				       src + ySize, ySize / 2);
+			}
+
+			/* subsampled luma histogram for the IPA's tone adaptation */
+			std::vector<uint32_t> hist(256, 0);
+			for (unsigned int y = 0; y < kOutputSize.height; y += 8)
+				for (unsigned int x = 0; x < kOutputSize.width; x += 8)
+					hist[dst[y * kOutputSize.width + x]]++;
+			ipa_->processOutput(j.frame, hist);
+		}
+	}
+
 	md.status = ret ? FrameMetadata::FrameError : FrameMetadata::FrameSuccess;
 	if (!ret) {
 		Span<FrameMetadata::Plane> planes = md.planes();
-		for (unsigned int i = 0; i < planes.size(); i++)
-			planes[i].bytesused = out->planes()[i].length;
+		if (planes.size() > 0)
+			planes[0].bytesused = ySize;
+		if (planes.size() > 1)
+			planes[1].bytesused = ySize / 2;
+		j.request->_d()->metadata().merge(j.metadata);
 	}
 
-	capture_->queueBuffer(raw);
+	if (running_ && j.raw)
+		capture_->queueBuffer(j.raw);
 
 	PipelineHandler *pipe = Camera::Private::pipe();
-	pipe->completeBuffer(request, out);
-	pipe->completeRequest(request);
+	pipe->completeBuffer(j.request, j.out);
+	pipe->completeRequest(j.request);
+
+	tryStartFrame();
+}
+
+void IPU7CameraData::abortFrame()
+{
+	if (!job_.stage)
+		return;
+
+	/* let the firmware finish the in-flight task before buffers go away */
+	PSysDevice::Event ev;
+	for (int i = 0; i < 2 && job_.stage; i++) {
+		if (psys_.wait(&ev, 500))
+			break;
+		if (ev.frame == job_.fid && job_.stage == 1 && !ev.error)
+			break;		/* node 0 done; node 1 is never submitted */
+	}
+	watchdog_.stop();
+
+	Job j = std::move(job_);
+	job_ = Job{};
+	j.out->_d()->metadata().status = FrameMetadata::FrameCancelled;
+	PipelineHandler *pipe = Camera::Private::pipe();
+	pipe->completeBuffer(j.request, j.out);
+	pipe->completeRequest(j.request);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -515,7 +684,8 @@ int PipelineHandlerIPU7::exportFrameBuffers(Camera *camera, Stream *stream,
 		LOG(IPU7, Error) << "No dma-buf allocator available";
 		return -ENODEV;
 	}
-	return allocator.exportBuffers(count, { ySize, ySize / 2 }, buffers);
+	/* the UV plane is padded so the ISP can write its full (padded) output directly */
+	return allocator.exportBuffers(count, { ySize, static_cast<unsigned int>(kOutSize) - ySize }, buffers);
 }
 
 int PipelineHandlerIPU7::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
@@ -544,6 +714,9 @@ int PipelineHandlerIPU7::start(Camera *camera, [[maybe_unused]] const ControlLis
 	}
 
 	data->frame_ = 0;	/* the firmware expects frame ids from 0 for every new graph */
+	data->job_ = IPU7CameraData::Job{};
+	data->psysNotifier_ = std::make_unique<EventNotifier>(data->psys_.fd(), EventNotifier::Read);
+	data->psysNotifier_->activated.connect(data, &IPU7CameraData::psysReady);
 	{
 		ControlList sensorCtrls;
 		ret = data->ipa_->start();
@@ -575,7 +748,10 @@ void PipelineHandlerIPU7::stopDevice(Camera *camera)
 	IPU7CameraData *data = cameraData(camera);
 
 	data->running_ = false;
+	data->abortFrame();
+	data->psysNotifier_.reset();
 	data->capture_->streamOff();
+	data->readyRaw_.clear();
 	data->ipa_->stop();
 
 	while (!data->pendingRequests_.empty()) {
@@ -585,6 +761,7 @@ void PipelineHandlerIPU7::stopDevice(Camera *camera)
 	}
 
 	data->rawPsys_.clear();
+	data->outPsys_.clear();
 	data->capture_->releaseBuffers();
 	data->rawBuffers_.clear();
 	data->psys_.close();
@@ -596,6 +773,7 @@ int PipelineHandlerIPU7::queueRequestDevice(Camera *camera, Request *request)
 	if (!request->findBuffer(&data->stream_))
 		return -ENOENT;
 	data->pendingRequests_.push(request);
+	data->tryStartFrame();
 	return 0;
 }
 

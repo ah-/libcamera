@@ -57,8 +57,8 @@ public:
 	/* Consume LBFF statistics; returns true if the sensor settings changed. */
 	bool processStats(const uint16_t *rgbs, const uint8_t *sat, const uint32_t *hist);
 
-	/* Consume the NV12 output (tone curve / white point adaptation). */
-	void processOutput(const uint8_t *nv12, unsigned int width, unsigned int height);
+	/* Consume a 256-bin histogram of the output luma (tone curve / white point adaptation). */
+	void processOutput(const uint32_t *yHistogram);
 
 	double colourGainR() const { return wbR_; }
 	double colourGainB() const { return wbB_; }

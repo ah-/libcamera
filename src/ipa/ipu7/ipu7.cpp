@@ -48,7 +48,7 @@ public:
 
 	void computeParams(uint32_t frame) override;
 	void processStats(uint32_t frame, ControlList *sensorControls, ControlList *metadata) override;
-	void processOutput(uint32_t frame) override;
+	void processOutput(uint32_t frame, const std::vector<uint32_t> &yHistogram) override;
 
 private:
 	uint8_t *buffer(BufferId id);
@@ -192,11 +192,10 @@ void IPAIPU7::processStats([[maybe_unused]] uint32_t frame, ControlList *sensorC
 					       static_cast<float>(isp_.colourGainB()) });
 }
 
-void IPAIPU7::processOutput([[maybe_unused]] uint32_t frame)
+void IPAIPU7::processOutput([[maybe_unused]] uint32_t frame, const std::vector<uint32_t> &yHistogram)
 {
-	const uint8_t *out = buffer(BufferId::Output);
-	if (out)
-		isp_.processOutput(out, 1920, 1080);
+	if (yHistogram.size() == 256)
+		isp_.processOutput(yHistogram.data());
 }
 
 } /* namespace ipa::ipu7 */

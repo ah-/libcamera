@@ -347,25 +347,25 @@ bool Ipu7Isp::processStats(const uint16_t *rgbs, const uint8_t *sat, const uint3
 	return memcmp(&old, &sensor_, sizeof(old)) != 0;
 }
 
-void Ipu7Isp::processOutput(const uint8_t *nv12, unsigned int width, unsigned int height)
+void Ipu7Isp::processOutput(const uint32_t *hist)
 {
 	if (frame_ % 2)
 		return;
 
-	long n = 0, hi = 0, dark = 0;
-	long hist[256] = {};
-	for (unsigned int r = 0; r < height; r += 8)
-		for (unsigned int c = 0; c < width; c += 8) {
-			int v = nv12[r * width + c];
-			n++;
-			hist[v]++;
-			hi += v > 228;
-			dark += v < 45;
-		}
-	double hif = double(hi) / n, darkf = double(dark) / n;
+	double n = 0, hi = 0, dark = 0;
+	for (int v = 0; v < 256; v++) {
+		n += hist[v];
+		if (v > 228)
+			hi += hist[v];
+		if (v < 45)
+			dark += hist[v];
+	}
+	if (n <= 0)
+		return;
+	double hif = hi / n, darkf = dark / n;
 
 	/* white point: push the 99th percentile towards 228 (limited range white is 235) */
-	long acc = 0;
+	double acc = 0;
 	int p99 = 255;
 	for (int k = 0; k < 256; k++) {
 		acc += hist[k];

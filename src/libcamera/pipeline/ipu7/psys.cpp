@@ -124,8 +124,7 @@ void PSysDevice::unimport(const Buffer &buf)
 	ioctl(fd_.get(), IPU_IOC_UNMAPBUF, (void *)(intptr_t)buf.fd);
 }
 
-int PSysDevice::run(uint8_t node, uint8_t frame, const std::vector<TermBuffer> &terms,
-		    int timeoutMs)
+int PSysDevice::submit(uint8_t node, uint8_t frame, const std::vector<TermBuffer> &terms)
 {
 	ipu_psys_term_buffers tb[MAX_GRAPH_TERMINALS] = {};
 	unsigned int n = 0;
@@ -151,23 +150,27 @@ int PSysDevice::run(uint8_t node, uint8_t frame, const std::vector<TermBuffer> &
 		LOG(IPU7, Error) << "TASK_REQUEST node " << int(node) << " failed: " << strerror(-ret);
 		return ret;
 	}
+	return 0;
+}
 
-	pollfd pfd = { fd_.get(), POLLIN, 0 };
-	int ret = poll(&pfd, 1, timeoutMs);
-	if (ret <= 0) {
-		LOG(IPU7, Error) << "PSYS node " << int(node) << " frame " << int(frame) << " timed out";
-		return -ETIMEDOUT;
-	}
-
+int PSysDevice::dequeue(Event *event)
+{
 	ipu_psys_event ev = {};
 	if (ioctl(fd_.get(), IPU_IOC_DQEVENT, &ev) < 0)
 		return -errno;
-	if (ev.error) {
-		LOG(IPU7, Warning) << "PSYS node " << int(node) << " frame " << int(frame)
-				   << " error " << ev.error;
-		return -EIO;
-	}
+	event->node = ev.node_ctx_id;
+	event->frame = ev.frame_id;
+	event->error = ev.error;
 	return 0;
+}
+
+int PSysDevice::wait(Event *event, int timeoutMs)
+{
+	pollfd pfd = { fd_.get(), POLLIN, 0 };
+	int ret = poll(&pfd, 1, timeoutMs);
+	if (ret <= 0)
+		return ret ? -errno : -ETIMEDOUT;
+	return dequeue(event);
 }
 
 } /* namespace libcamera */

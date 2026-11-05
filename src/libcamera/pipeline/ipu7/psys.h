@@ -40,8 +40,21 @@ public:
 	int import(int fd, size_t len, Buffer *buf);
 	void unimport(const Buffer &buf);
 
-	int run(uint8_t node, uint8_t frame, const std::vector<TermBuffer> &terms,
-		int timeoutMs = 2000);
+	struct Event {
+		uint8_t node;
+		uint8_t frame;
+		uint32_t error;
+	};
+
+	int fd() const { return fd_.get(); }
+	bool isOpen() const { return fd_.isValid(); }
+
+	/* Queue a task; completion is reported through an event (see dequeue()). */
+	int submit(uint8_t node, uint8_t frame, const std::vector<TermBuffer> &terms);
+	/* Dequeue one completion event (call when fd() is readable). */
+	int dequeue(Event *event);
+	/* Wait up to timeoutMs for one event. */
+	int wait(Event *event, int timeoutMs);
 
 private:
 	UniqueFD fd_;
