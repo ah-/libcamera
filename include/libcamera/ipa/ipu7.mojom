@@ -24,7 +24,7 @@ enum BufferId {
 	StatsAe = 9,		/* node 0 terminal 10: 4 x 256 bin histograms (read by IPA) */
 	StatsRgbs = 10,		/* node 0 terminal 12: RGBS grid (read by IPA) */
 	StatsSat = 11,		/* node 0 terminal 13: per-block saturation (read by IPA) */
-	Output = 12,		/* node 1 terminal 14: NV12 output (read by IPA for tone adaptation) */
+	Output = 12,		/* node 1 terminal 14: NV12 output (copy path only, not read by the IPA) */
 };
 
 struct IPAConfigInfo {
@@ -44,7 +44,8 @@ interface IPAIPU7Interface {
 
 	computeParams(uint32 frame) => ();
 	processStats(uint32 frame) => (libcamera.ControlList sensorControls, libcamera.ControlList metadata);
-	processOutput(uint32 frame) => ();
+	/* yHistogram: 256-bin histogram of the output luma (subsampled), for tone adaptation */
+	processOutput(uint32 frame, array<uint32> yHistogram) => ();
 };
 
 interface IPAIPU7EventInterface {
