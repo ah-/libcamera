@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+/*
+ * \todo Document the interface and remove the related EXCLUDE_PATTERNS entry.
+ */
+
+module ipa.ipu7;
+
+import "include/libcamera/ipa/core.mojom";
+
+/*
+ * Buffers shared between the pipeline handler and the IPA. The ids are fixed: the pipeline
+ * allocates one dma-buf per role at init time and maps it to the IPA with that id.
+ */
+enum BufferId {
+	LbffParams = 1,		/* node 0 terminal 0: LBFF register images (written by IPA) */
+	LscTable = 2,		/* node 0 terminal 8: lens shading table (written by IPA) */
+	LbffProgram = 3,	/* node 0 terminal 1 (written by IPA from templates) */
+	LbffSystem = 4,		/* node 0 terminal 2 (written by IPA from templates) */
+	BbpsParams = 5,		/* node 1 terminal 0 */
+	BbpsProgram = 6,	/* node 1 terminal 1 */
+	BbpsSystem = 7,		/* node 1 terminal 2 */
+	BbpsFrame = 8,		/* node 1 terminal 3 */
+	StatsAe = 9,		/* node 0 terminal 10: 4 x 256 bin histograms (read by IPA) */
+	StatsRgbs = 10,		/* node 0 terminal 12: RGBS grid (read by IPA) */
+	StatsSat = 11,		/* node 0 terminal 13: per-block saturation (read by IPA) */
+	Output = 12,		/* node 1 terminal 14: NV12 output (read by IPA for tone adaptation) */
+};
+
+struct IPAConfigInfo {
+	libcamera.IPACameraSensorInfo sensorInfo;
+	libcamera.ControlInfoMap sensorControls;
+};
+
+interface IPAIPU7Interface {
+	init(libcamera.IPASettings settings) => (int32 ret);
+	configure(IPAConfigInfo configInfo) => (int32 ret);
+	start() => (int32 ret);
+	sensorControls(uint32 frame) => (libcamera.ControlList sensorControls);
+	stop();
+
+	mapBuffers(array<libcamera.IPABuffer> buffers);
+	unmapBuffers(array<uint32> ids);
+
+	computeParams(uint32 frame) => ();
+	processStats(uint32 frame) => (libcamera.ControlList sensorControls, libcamera.ControlList metadata);
+	processOutput(uint32 frame) => ();
+};
+
+interface IPAIPU7EventInterface {
+	/* Reserved for asynchronous operation; the first version is fully synchronous. */
+	error(int32 code);
+};
