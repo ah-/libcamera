@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# Sony IMX471 (ThinkPad X1 Carbon Gen 14) on the Intel IPU7.5 hardware ISP.
+version: 1
+
+# Directory with the recorded graph-independent templates (bundles/g0 … g30), relative to this
+# file. LIBCAMERA_IPU7_DATA overrides it.
+templates: imx471
+
+ae:
+  # Centre-weighted linear mean of the RGBS grid (of 65535). Intel exposes low (~7.7 %) and
+  # lifts with the tone curve, which keeps highlights.
+  target: 4700
+  # Total sensor gain cap (16x analogue x 2x digital).
+  gain_max: 32
+  # Exposure may stretch frames down to this rate before adding more gain.
+  min_fps: 15
+
+tone:
+  # Cap on the adaptive shadow lift (tone-gain LUT exponent). Higher = brighter shadows, more
+  # visible noise.
+  shadow_lift_max: 2.3
+
+denoise:
+  # Take the BNLM/XNR noise-reduction blocks from the template this many gain stops above the
+  # current one. Measured at ~4.5x gain: 0 → grain 2.90, 1 → 2.39, 2 → 1.42, 3 → 0.57 (smeared).
+  template_offset: 2
+
+lsc:
+  # Lens-shading (gain - 1) scale reached at ~60x gain (Intel weakens LSC in very low light).
+  low_light_strength: 0.86
+...
